@@ -72,35 +72,88 @@ Capture the control group you'll compare every incident against.
 
 ### Hypothesis
 > From the symptoms alone (fast when isolated, collapses under concurrent
-> searches, other endpoints unaffected), I think the cause is
-> ____________________________________________________________________________
-> because __________________________________________________________________.
+> searches, other endpoints unaffected), I think the cause is a full table
+> scan on the `last_name` column, likely with no supporting index, combined
+> with an unbounded result set (no LIMIT). This would explain why a single
+> search feels instant (one scan is cheap) but concurrent searches compete
+> for CPU/disk I/O and blow up non-linearly, while other endpoints (like
+> "recent patients", likely ordered by an indexed column) are unaffected
+> because they don't share this access pattern.
 
 ### Observation (evidence)
-> Investigate how the database executes the search. Paste what you find:
+> Confirmed via EXPLAIN ANALYZE that the search executes a full table scan:
 > ```
->
+> mysql> EXPLAIN ANALYZE SELECT * FROM patients WHERE last_name = 'Smith';
+> -> Filter: (patients.last_name = 'Smith')  (cost=10276 rows=9819)
+>    (actual time=0.0527..91.8 rows=10000 loops=1)
+>    -> Table scan on patients  (cost=10276 rows=98191)
+>       (actual time=0.0356..81.4 rows=100000 loops=1)
 > ```
+> No index existed on `last_name` (confirmed via SHOW CREATE TABLE — only
+> PRIMARY KEY(id) existed). The endpoint also ran `SELECT *` with no LIMIT,
+> returning every matching row (~10,000 for a common surname) with every
+> column, including a TEXT `notes` field.
+
 | Metric (under load) | Value | vs. baseline |
 |---------------------|-------|--------------|
-| p95 latency         |       |              |
-| RPS                 |       |              |
-| Error rate          |       |              |
-| Rows examined / req |       |              |
+| p95 latency         | 33.77s | ~1,330x worse (baseline 25.37ms) |
+| RPS                 | 9.23  | ~5.4x worse (baseline 49.49) |
+| Error rate          | 0.00% | same (requests succeed, just extremely slow) |
+| Rows examined / req | ~100,000 (full scan) | N/A (no baseline scan) |
 
 ### Root cause & mechanism
-> What is the database doing per request, and why does cost blow up with data
-> size and concurrency? Name the mechanism and the data structure involved.
-> Estimate the cost difference between the current behaviour and the ideal one
-> for ~100,000 rows. _________________________________________________________
+> MySQL performs a full table scan for every search request because no index
+> exists on `last_name` — it must read all ~100,000 rows to find matches
+> regardless of how many actually match. This costs ~80-90ms of real work per
+> request even in isolation, which is why a lone search "feels instant."
+> Under shift-change concurrency (200 simultaneous searchers), 200 concurrent
+> full-table scans compete for the same CPU and buffer-pool I/O, and — because
+> the query also has no LIMIT — 200 concurrent multi-thousand-row, full-column
+> JSON payloads (including large TEXT notes fields) compete for serialization
+> time on Node's single-threaded event loop. This matches classic queueing
+> behavior: service time stays roughly fixed per request, but queue time
+> explodes non-linearly once concurrent demand crosses the system's effective
+> capacity — the "hockey stick."
+>
+> Capacity math: without an index, cost scales O(n) with table size — every
+> search reads all ~100,000 rows no matter how many match. With a B-tree
+> index, cost scales closer to O(log n + k) where k is the number of actual
+> matches — for ~100,000 rows that's roughly 17 comparisons to locate the
+> start of a match range, versus 100,000 row reads. This is a fundamentally
+> different amplification profile, not just "the same query, done faster."
 
 ### Fix & verify
-> The change you made (be specific): ________________________________________
-> Re-run evidence — new query behaviour: ____________________________________
-> New p95: ______  New RPS: ______  Improvement factor: ______×
-> Any trade-off introduced by your fix? ______________________________________
-
----
+> The change you made (be specific): Two changes — (1) added a B-tree index
+> on `last_name` via `ALTER TABLE patients ADD INDEX idx_last_name (last_name)`,
+> persisted in `data-seed/seed.sh` so it survives a re-seed; (2) changed the
+> query from `SELECT * FROM patients WHERE last_name = ?` (unbounded) to
+> `SELECT id, first_name, last_name, diagnosis FROM patients WHERE last_name = ? LIMIT 50`
+> (bounded, fewer columns, no large TEXT field).
+>
+> Before applying the LIMIT fix, I isolated the index's effect alone and also
+> tested increasing `connectionLimit` from 2 to 20 as an alternative fix.
+> That made p95 WORSE (48.4s vs the 33.77s pre-fix baseline) — direct
+> counter-evidence that connection pool size was not the bottleneck. More
+> connections meant more concurrent giant payloads competing for the same
+> single-threaded CPU doing JSON serialization, which made contention worse.
+> I reverted the pool to its original size (2) and applied the LIMIT fix
+> instead, which was the actual root cause.
+>
+> Re-run evidence — new query behaviour: `EXPLAIN ANALYZE` now shows
+> `Index lookup on patients using idx_last_name` instead of a table scan,
+> cost dropped from 10276 to 2371.
+>
+> New p95: 248.71ms  New RPS: 1131.86  Improvement factor: ~136x (p95), ~123x (RPS)
+>
+> Any trade-off introduced by your fix? At this much higher throughput
+> ceiling, a new failure mode surfaced: ~24.68% of requests failed with
+> connection resets/EOF errors. This appears to be `connectionLimit: 2` in
+> `api/database.js` becoming a bottleneck now that requests complete fast
+> enough for far more of them to queue for the same 2 connections within a
+> given window. This is a different mechanism from OPS-2201's reported
+> symptom (which is now fully resolved) and looks like it may be the
+> underlying mechanism behind OPS-2202 — investigating there rather than
+> patching here.
 
 ## Investigation — OPS-2202
 *Ticket:* [Whole app freezes during surges, DB looks idle](./incidents/OPS-2202.md)
