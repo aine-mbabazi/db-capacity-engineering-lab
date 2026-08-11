@@ -161,39 +161,85 @@ Capture the control group you'll compare every incident against.
 
 ### Hypothesis
 > Given the query is trivial and the DB is idle yet requests pile up, I think
-> the bottleneck is ________________________________________________________
-> because __________________________________________________________________.
+> the bottleneck is the application's connection pool (connectionLimit: 2 in
+> api/database.js) combined with unbounded queueing (queueLimit: 0). Every
+> request, no matter how cheap, must wait for one of only 2 MySQL connections
+> before it can even run -- under a surge, requests would pile into an
+> ever-growing queue rather than being rejected, explaining why the DB stays
+> idle (it's only ever serving 2 queries at once) while the app appears frozen.
 
 ### Observation (evidence)
-> Where is time spent between request arrival and query execution? Capture the
-> error codes and any queue/timeout evidence from logs and metrics:
+> Confirmed via docker stats during the surge:
 > ```
->
+> capacity-api   CPU 156.08%   MEM 84.11MiB/160MiB (52.57%)
+> mysql-db       CPU 22.90%    MEM 200.8MiB/15.43GiB (1.27%)
 > ```
+> MySQL is nowhere near saturated (22.9% CPU) while capacity-api is CPU-bound
+> at over 1 core (156%) -- the bottleneck is in the app tier, not the DB engine.
+> No 500 errors occurred; requests simply queued for multiple seconds before
+> eventually succeeding.
+
 | Metric                    | Value | vs. baseline |
 |---------------------------|-------|--------------|
-| Successful RPS (plateau)  |       |              |
-| p95 / p99 latency         |       |              |
-| Error / timeout rate      |       |              |
-| Avg service time per query (s) |  |              |
+| Successful RPS (plateau)  | 574 (arrival rate) | ~11.6x baseline |
+| p95 / p99 latency         | p95=4.57s | ~180x worse than baseline (25.37ms) |
+| Error / timeout rate      | 0.00% (queueing, not failing) | same |
+| Avg service time per query (s) | 0.0105s (10.5ms, measured via curl) | -- |
 
 ### Root cause & mechanism
 > Explain the paradox: idle database, trivial query, stalled app. What finite
 > resource is being contended, and where does it live? Derive the *right* size
 > for that resource from your measured throughput and service time (state the
 > relationship you used):
-> - Measured avg service time W = ______ s
-> - Target throughput λ = ______ req/s
-> - Required capacity = ______  (show your working)
-> Why does making it arbitrarily large eventually stop helping? ______________
+> - Measured avg service time W = 0.0105 s
+> - Target throughput lambda = 574 req/s (measured surge arrival rate)
+> - Required capacity = lambda x W = 574 x 0.0105 approx 6 connections needed
+>   to keep pace; with headroom (the deck's "50% rule"), ~12 would be a
+>   reasonable minimum. The pool only had 2 -- roughly 3x under-provisioned
+>   relative to actual demand, though as shown below, simply raising this
+>   number doesn't solve the problem.
+>
+> The contended resource is the MySQL connection pool acting as an admission
+> gate: with only 2 connections and queueLimit: 0 (unlimited queueing), every
+> request beyond the pool's ~190 req/s serving capacity (2 connections /
+> 0.0105s) piles into an unbounded internal queue rather than being rejected.
+> Per Little's Law (L = lambda x W), as queue depth L grows without bound,
+> wait time explodes non-linearly -- the classic queueing "hockey stick."
+>
+> Why does making it arbitrarily large eventually stop helping? Because the
+> real constraint isn't connection count -- it's the application's single CPU
+> core / single-threaded event loop. More connections just means more work
+> (query execution, JSON serialization) competing for the same CPU at once,
+> which increases contention rather than relieving it -- confirmed directly below.
 
 ### Fix & verify
-> The change you made: ______________________________________________________
-> New RPS: ______  New error rate: ______  New p95: ______
+> The change you made: Added admission-control middleware that caps concurrent
+> in-flight requests at 100, returning a fast, explicit 503 Service Unavailable
+> for anything beyond that cap, instead of letting requests queue indefinitely.
+> Before landing on this, I tested the intuitive "just add more connections" fix
+> (connectionLimit 2 to 20) as a control: it made things WORSE (p95 rose from
+> 4.57s to 14.04s, error rate rose from 0% to 19%), which is direct
+> counter-evidence that pool size was never the bottleneck. Reverted the pool
+> to 2 and applied the admission-control fix instead.
+>
+> New RPS: unchanged arrival rate (574 req/s), but requests are now resolved
+> quickly either way -- overall p95 latency ~100ms (200s and 503s combined)
+> at a 150-VU test.
+> New error rate: at 150 VUs, 94.96% of requests get 503 (correct behavior --
+> intentionally overloading a 100-concurrent-request cap with continuous
+> 150-VU load); overall response time for both 200s and 503s stayed under
+> 1.2s even in the worst case, vs. multi-second-to-collapse before.
+> New p95 (successful requests only): 1.17s.
+>
 > What upstream protection would make a burst degrade gracefully instead of
-> collapsing? _______________________________________________________________
-
----
+> collapsing? The admission-control middleware itself is that protection --
+> callers get a fast, actionable 503 instead of an indefinite hang, so clients
+> can retry with backoff instead of piling on. A production deployment would
+> pair this with a reverse proxy / load balancer doing the same admission
+> control at the network edge, since at extreme concurrency (2000+ VUs in
+> testing) the OS TCP listen backlog gets exhausted before requests even reach
+> this middleware -- a limitation discovered during testing, documented in
+> evidence/OPS-2202-evidence.md.
 
 ## Investigation — OPS-2203
 *Ticket:* [Bed admissions fail with DB errors under load](./incidents/OPS-2203.md)
