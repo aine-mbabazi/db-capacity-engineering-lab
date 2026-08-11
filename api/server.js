@@ -141,12 +141,10 @@ app.post('/api/hospitals/:id/admit', async (req, res) => {
       [hospitalId]
     );
 
-    // Notify the external regional bed registry of the new count before we
-    // commit (simulated here with a network round-trip latency).
-    await notifyBedRegistry(hospitalId);
 
     await conn.commit();
     res.json({ status: 'admitted', hospitalId });
+    notifyBedRegistry(hospitalId).catch(() => {});
   } catch (err) {
     if (conn) {
       try { await conn.rollback(); } catch (_) { /* ignore */ }
