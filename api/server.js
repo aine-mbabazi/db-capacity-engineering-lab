@@ -100,7 +100,7 @@ app.get('/api/patients/search', async (req, res) => {
   try {
     const pool = getPool();
     const [rows] = await pool.query(
-      'SELECT * FROM patients WHERE last_name = ?',
+      'SELECT id, first_name, last_name, diagnosis FROM patients WHERE last_name = ? LIMIT 50',
       [lastName]
     );
     res.json({ count: rows.length, lastName, data: rows });

@@ -50,6 +50,7 @@ CREATE TABLE patients (
   created_at   TIMESTAMP    DEFAULT CURRENT_TIMESTAMP
 ) ENGINE=InnoDB;
 
+
 CREATE TABLE hospitals (
   id             INT AUTO_INCREMENT PRIMARY KEY,
   name           VARCHAR(128) NOT NULL,
@@ -80,6 +81,8 @@ SELECT
   ELT(1 + (n % 5), 'Hypertension','Diabetes','Asthma','Fracture','Migraine'),
   REPEAT(CONCAT('Clinical note for patient ', n, '. '), 6)
 FROM seq;
+
+CREATE INDEX idx_last_name ON patients (last_name);
 
 SELECT CONCAT('patients rows: ', COUNT(*)) AS seeded FROM patients;
 SELECT CONCAT('hospitals rows: ', COUNT(*)) AS seeded FROM hospitals;
