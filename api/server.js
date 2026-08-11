@@ -20,6 +20,19 @@ const { getPool, getMongo } = require('./database');
 
 const app = express();
 app.use(express.json());
+const MAX_CONCURRENT_REQUESTS = 100;
+let inFlight = 0;
+app.use((req, res, next) => {
+  if (inFlight >= MAX_CONCURRENT_REQUESTS) {
+    return res.status(503).json({ error: 'SERVER_BUSY', message: 'Too many concurrent requests' });
+  }
+  inFlight++;
+  let released = false;
+  const release = () => { if (!released) { released = true; inFlight--; } };
+  res.on('finish', release);
+  res.on('close', release);
+  next();
+});
 
 const PORT = Number(process.env.PORT || 3000);
 
