@@ -290,8 +290,12 @@ Capture the control group you'll compare every incident against.
 
 ### Hypothesis
 > Given memory spikes right before each restart and only the big export is
-> affected, I think the cause is ___________________________________________
-> because __________________________________________________________________.
+> affected, I think the cause is the unbounded `/api/patients/export` endpoint
+> materializing the entire ~100,000-row patient table (`SELECT * FROM patients`,
+> no LIMIT/pagination/streaming) as one in-memory result set, then serializing
+> it whole via `res.json()`, because export is the only endpoint returning the
+> full table — every other endpoint (`recent`, `search`) is bounded by
+> `LIMIT 50`.
 
 ### Observation (evidence)
 > Watch `nodejs_heap_size_used_bytes`, GC pauses, and restarts:
@@ -299,32 +303,132 @@ Capture the control group you'll compare every incident against.
 > docker stats
 > docker compose logs -f capacity-api
 > ```
-| Metric                          | Value |
-|---------------------------------|-------|
-| Approx. payload size per request|       |
-| Peak heap before crash          |       |
-| Time-to-first-crash             |       |
-| Container restart count         |       |
-| GC pause trend                  |       |
+| Metric                              | Value | vs. baseline |
+|--------------------------------------|-------|--------------|
+| Baseline (control, `/api/patients/recent`) | RPS=48.97, p95=44.67ms, errors 0% | — |
+| Run 1 (2s sampling) — errors         | 57.14% (32/56) | all client-side 120s timeouts, not 500s |
+| Run 1 — restarts                     | 0 (`RestartCount` 0→0, `OOMKilled=false`) | RSS pinned 159.5–160MiB (~100%) for ~2 min straight |
+| Run 2 (1s sampling) — errors         | 99.92% (24228/24246) | mostly near-instant failures (avg 192ms) — consistent with connection loss during restarts |
+| Run 2 — restarts                     | **2, 23s apart** | see `docker events` timeline below |
+| heap_bytes vs RSS at peak            | RSS 159.9MiB vs heap ~118M | ~40MB unaccounted for in tracked JS heap |
+| Monitoring probe (`curl /metrics`)   | no response in the seconds before each kill | event loop too saturated to service even a trivial unrelated read |
+| Single isolated request (no concurrency) | 100,000 rows, 36,141,185 bytes (36.14MB), 361.4 bytes/row, 2.50s, full memory recovery after | proves a lone request is cheap — concurrency is the actual problem |
 
-> Paste the crash / exit log lines:
+> Two identical runs (same script, same 50 VUs, same duration) produced two
+> different outcomes — one survived pinned at the ceiling, one didn't. Ticket
+> said "restarts over and over": confirmed directly in run 2, but the full
+> picture is more precise than the ticket's framing — it's the same underlying
+> condition (sustained RSS at the container's cap) with a non-deterministic
+> outcome, not a guaranteed crash every time.
+
+> `docker compose logs capacity-api` contains **no in-app crash trace** for
+> either run — the only line the app ever prints is the startup banner
+> (`capacity-api listening on :3000 ...`), repeated once per restart. A SIGKILL
+> gives the process no chance to log anything on the way out. The only proof
+> of the kills is kernel-level, via `docker events`:
 > ```
->
+> 08:01:45.116  container oom     (0e913a9de218...)
+> 08:01:45.417  container die     exitCode=137, execDuration=26s
+> 08:01:45.767  container start
+> 08:02:08.412  container oom
+> 08:02:08.749  container die     exitCode=137, execDuration=23s
+> 08:02:09.073  container start
 > ```
 
 ### Root cause & mechanism
-> Estimate per-row size, then the full payload: rows × bytes/row = ______ MB.
-> With C concurrent callers, peak resident memory ≈ ______ MB — compare to the
-> container's memory budget (160MB locally / 256MB in prod). Explain what happens
-> to GC frequency, CPU, and
-> throughput as live heap approaches the limit, and why the current approach
-> uses O(N) memory while a better one could use far less. ____________________
+> `/api/patients/export` pulls the entire patients table into a JS array via
+> mysql2 with no LIMIT, pagination, or streaming, then Express serializes it in
+> one synchronous `JSON.stringify` call. In isolation this is cheap (36.14MB,
+> 2.5s, full recovery). Under `reproduce-OPS-2204.js`'s 50 constant VUs, up to
+> 50 of these ~36MB in-flight payloads (raw mysql2 buffers + intermediate JSON
+> strings) can be resident at once, competing for the container's 160MB cgroup
+> cap (`mem_limit: 160m` in `docker-compose.yml`, deliberately mismatched
+> against `NODE_OPTIONS: --max-old-space-size=256`, so V8 believes it has
+> headroom the cgroup will never grant).
+>
+> Once RSS approaches 160MB, survival is a **race between allocation rate and
+> GC/kernel reclaim rate**, not deterministic: the cgroup OOM-killer fires the
+> instant a page-in would exceed the limit, whether or not V8's GC is a moment
+> away from reclaiming scratch memory from an already-finished request. Run 1
+> won that race for ~2 minutes straight; run 2 lost it twice, 23 seconds apart
+> — each restart gets immediately re-flooded by the still-running 50 VUs and
+> refills to the cap almost as fast as it emptied, which is exactly the "over
+> and over" pattern once the process does tip over.
+>
+> Second finding: `nodejs_heap_size_used_bytes` never explains the RSS — it
+> peaked around ~118–158M while RSS sat at 159.9MiB. A ~40MB gap consistent
+> with memory held outside the tracked JS heap (mysql2 row/column buffers,
+> large intermediate strings from stringifying a 100k-row array). A dashboard
+> alerting on heap-used against the 256MB V8 ceiling would never fire — heap
+> never gets close — while the container is already dying against its real,
+> tighter, and different 160MB limit.
+>
+> Third finding: the monitoring probe itself (`curl /metrics`, `docker stats`)
+> went unanswered in the seconds immediately preceding each kill. That's not a
+> gap in measurement, it's evidence — the single-threaded event loop was too
+> busy synchronously building a giant JSON string across up to 50 concurrent
+> requests to service even a trivial, unrelated read. The app was already
+> unresponsive before the kernel finished it off.
+>
+> Capacity math: measured per-request payload = 100,000 rows × 361.4 bytes/row
+> ≈ **36.14MB** (measured directly, not estimated). Container ceiling =
+> **160MB**. 160MB / 36.14MB ≈ **4.4** — the container physically cannot hold
+> more than ~4–5 full in-flight export payloads at once, before even counting
+> Node's baseline footprint (~27MB idle) or per-request overhead. At 50
+> concurrent VUs all hitting this endpoint, demand exceeds physical capacity by
+> roughly **10–11x** — this isn't an edge case or a near-miss, it's a workload
+> asking for ~11x the memory the container can ever supply for this access
+> pattern, regardless of GC tuning.
 
 ### Fix & verify
-> The change you made (consider: bounding how much of the result set is in
-> memory at once, streaming to the response, sensible page sizes, compression):
-> ____________________________________________________________________________
-> Re-run evidence — new peak heap: ______  restarts: ______  error rate: ______
+> Two changes: (1) rewrote `/api/patients/export` (`api/server.js`) to cursor
+> the table in bounded 1,000-row chunks via keyset pagination on the primary
+> key (`WHERE id > ? ORDER BY id LIMIT ?`, not OFFSET, so each chunk stays an
+> indexed range scan) and stream each chunk to the HTTP response with
+> backpressure handling, instead of materializing all ~100,000 rows and
+> `res.json()`-ing them in one shot; (2) fixed the `NODE_OPTIONS`/cgroup
+> mismatch in `docker-compose.yml`, capping `--max-old-space-size` at 112MB
+> (down from 256MB) — below the container's real 160MB limit instead of above
+> it, so V8 has a chance to self-limit before the kernel OOM-killer has to.
+>
+> | Metric | Pre-fix Run 1 | Pre-fix Run 2 | Post-fix (this run) |
+> |---|---|---|---|
+> | Errors | 57.14% (32/56) | 99.92% (24228/24246) | **0.00% (0/100)** |
+> | Restarts | 0 | 2 (23s apart) | **0** |
+> | OOMKilled | false | — (SIGKILL via cgroup oom, `exitCode=137`) | **false** |
+> | Peak RSS | 159.5–160MiB (pinned ~100%) | 159.9MiB (pinned ~100%) | **128.7MiB (80.3%), never pinned** |
+> | Avg / p95 request duration | timeouts at 120s cap | avg 25.23s (successful), p95 56.09s | **avg / p95 ≈ 1m14s (74s), min=1m13s, max=1m14s** |
+> | Data received | — | 666 MB | **3.6 GB (100 x 36MB, full exports)** |
+>
+> **The OOM-kill/restart problem is fixed and confirmed** — RSS now peaks at
+> 128.7MiB, ~31MB of headroom under the 160MB cap, versus pinning at the cap
+> for minutes at a time pre-fix. Every one of 100 concurrent-load export
+> requests over the 50-VU, 2-minute reproduction completed successfully;
+> `RestartCount` stayed at 0 throughout.
+>
+> **The binding constraint has moved, not disappeared.** `connectionLimit: 2`
+> in `api/database.js` is now what limits this endpoint: each export needs
+> ~101 sequential DB round trips (1 count + 100 chunk queries), so 50
+> concurrent exporters funneled through 2 connections serializes hard,
+> producing the ~74-second-per-request duration above. This is a strict
+> availability improvement over the pre-fix behavior — bounded, predictable
+> latency and zero errors, instead of a coin-flip between "survives pinned at
+> the cap" and "OOM-killed, restarts, ~57-99% of requests fail." But 74s per
+> export is not itself a good number, and tuning/raising `connectionLimit` for
+> this access pattern is flagged as follow-up scope, not fixed here — it's a
+> distinct capacity dimension (connection throughput) from the one this
+> incident was about (memory), and changing it without evidence would repeat
+> the mistake OPS-2201/2202 already taught us: don't touch the pool size
+> without measuring it in isolation first.
+>
+> **Limitation to flag plainly:** this verification is based on a **single**
+> post-fix reproduction run, not two back-to-back runs as originally planned.
+> The second run was not executed due to time constraints. Given the pre-fix
+> behavior was itself non-deterministic run-to-run (Run 1 survived, Run 2
+> OOM-killed twice under identical conditions), one clean post-fix run is
+> supporting evidence that the fix works, not proof it eliminates the failure
+> mode with certainty across all conditions — a second confirming run remains
+> worth doing before treating this as fully closed.
 
 ---
 

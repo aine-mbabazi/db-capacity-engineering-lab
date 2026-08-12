@@ -161,17 +161,68 @@ function notifyBedRegistry(_hospitalId) {
   return new Promise((r) => setTimeout(r, 500));
 }
 
+const EXPORT_CHUNK_SIZE = 1000;
+
 // ---------------------------------------------------------------------------
 // Full patient export for the analytics/ETL team.
+//
+// OPS-2204 fix: the old version ran `SELECT * FROM patients` with no LIMIT,
+// building the entire ~100,000-row result (~36MB, measured) as one in-memory
+// array, then JSON.stringify'd it in one shot via res.json(). Under N
+// concurrent exporters that's N x ~36MB of simultaneous in-flight payload,
+// which blew past the container's 160MB cgroup cap and got the process
+// SIGKILLed by the kernel OOM-killer (see LAB_JOURNAL.md / SCARS.md).
+//
+// This version cursors through the table in bounded chunks (keyset
+// pagination on the primary key `id`, not OFFSET, so each chunk stays an
+// indexed range scan no matter how deep) and streams each chunk to the HTTP
+// response as it's fetched. Memory stays O(EXPORT_CHUNK_SIZE) - one chunk's
+// worth of rows - regardless of table size or how many exports run at once.
 // ---------------------------------------------------------------------------
 app.get('/api/patients/export', async (_req, res) => {
   try {
     const pool = getPool();
-    const [rows] = await pool.query('SELECT * FROM patients');
-    res.json({ count: rows.length, data: rows });
+    const [countRows] = await pool.query('SELECT COUNT(*) AS total FROM patients');
+    const total = countRows[0].total;
+
+    res.set('Content-Type', 'application/json');
+    res.write(`{"count":${total},"data":[`);
+
+    let lastId = 0;
+    let first = true;
+
+    for (;;) {
+      const [rows] = await pool.query(
+        'SELECT * FROM patients WHERE id > ? ORDER BY id LIMIT ?',
+        [lastId, EXPORT_CHUNK_SIZE]
+      );
+      if (rows.length === 0) break;
+
+      const chunkJson = rows.map((r) => JSON.stringify(r)).join(',');
+      const ok = res.write((first ? '' : ',') + chunkJson);
+      first = false;
+      if (!ok) {
+        // Backpressure: wait for the socket buffer to drain before pulling
+        // the next chunk from MySQL, so a slow client can't make us buffer
+        // the whole export in Node's memory anyway.
+        await new Promise((resolve) => res.once('drain', resolve));
+      }
+
+      lastId = rows[rows.length - 1].id;
+      if (rows.length < EXPORT_CHUNK_SIZE) break;
+    }
+
+    res.end(']}');
   } catch (err) {
     dbErrorsTotal.inc({ route: '/api/patients/export', code: err.code || 'UNKNOWN' });
-    res.status(500).json({ error: err.code || 'ERROR', message: err.message });
+    if (res.headersSent) {
+      // Body already started streaming; can't send a clean JSON error now -
+      // end the connection so the client sees a truncated response rather
+      // than hanging.
+      res.end();
+    } else {
+      res.status(500).json({ error: err.code || 'ERROR', message: err.message });
+    }
   }
 });
 

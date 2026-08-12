@@ -48,10 +48,14 @@ services:
     container_name: capacity-api
     environment:
       PORT: 3000
-      # Let V8 believe it may grow its heap larger than the container can back,
-      # so an unbounded query (OPS-2204) over-commits and the kernel OOM-kills
-      # the process — a real crash + restart, not a graceful teeter at the cap.
-      NODE_OPTIONS: "--max-old-space-size=256"
+      # OPS-2204 fix: cap V8's old-space below this container's actual 160MB
+      # cgroup limit (mem_limit / deploy.resources.limits.memory below),
+      # instead of the old 256MB figure that let V8 believe it had more heap
+      # room than the kernel would ever grant. 112MB leaves ~48MB (30%)
+      # headroom under the 160MB cap for non-heap overhead (native buffers,
+      # other V8 spaces, thread stacks), so V8's own allocation-failure
+      # handling gets a chance to react before the kernel OOM-killer does.
+      NODE_OPTIONS: "--max-old-space-size=112"
       MYSQL_HOST: mysql-db
       MYSQL_PORT: 3306
       MYSQL_USER: root
@@ -69,13 +73,16 @@ services:
         condition: service_healthy
       mongo-db:
         condition: service_started
-    # Production runs this service in a 256MB container. Locally we cap it at
-    # 160MB AND tell V8 it may grow its heap to 256MB (see NODE_OPTIONS above).
-    # That mismatch is the point: a container-aware Node would GC to survive, so
-    # under the nightly-export load (OPS-2204) V8 over-commits past the 160MB
-    # cgroup limit and the kernel OOM-kills the process — a real crash + restart
-    # loop, not a graceful teeter. Verified: RestartCount climbs, ~99% of
-    # requests fail during the storm, and the service recovers once it stops.
+    # Production runs this service in a 256MB container; locally we cap it
+    # tighter at 160MB so the ceiling is reachable within a short test run.
+    # OPS-2204: this used to also set NODE_OPTIONS=--max-old-space-size=256,
+    # letting V8 believe it had more heap room than either container actually
+    # grants. Under the nightly-export load that mismatch let V8 over-commit
+    # past the real limit and the kernel OOM-killed the process (RestartCount
+    # climbed, ~99% of requests failed during the storm — see LAB_JOURNAL.md /
+    # SCARS.md). Fixed by (1) rewriting /api/patients/export to stream
+    # bounded chunks instead of materializing the full result set, and (2)
+    # capping NODE_OPTIONS below this container's actual limit (see above).
     deploy:
       resources:
         limits:
