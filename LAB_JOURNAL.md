@@ -1,6 +1,6 @@
 # 🧾 On-Call Lab Journal — Regional Health
 
-**Engineer:** ______________________  **Date:** ______________________
+**Engineer:** Patricia Ainembabazi **Date:** 2026/08/11
 
 This is your investigation notebook. You are on call for the Regional Health
 platform and working the [incident queue](./incidents/README.md). For each
