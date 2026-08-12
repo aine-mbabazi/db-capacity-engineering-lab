@@ -247,8 +247,14 @@ Capture the control group you'll compare every incident against.
 
 ### Hypothesis
 > Given one-at-a-time works but concurrent admits to the *same* hospital fail,
-> I think the cause is _____________________________________________________
-> and the failure will show up as ______ (a DB error? a timeout? a stall?) ___.
+> I think the cause is the admit handler holding a row-level exclusive lock on
+> that hospital's row for longer than the UPDATE itself needs — specifically,
+> an external call performed inside the transaction, before COMMIT — so every
+> concurrent admit to the same hospital queues behind whichever transaction
+> currently holds the lock. The failure will show up as a DB error: requests
+> queue with rising latency and then fail with a lock-wait-timeout error once
+> a queued transaction exceeds MySQL's `innodb_lock_wait_timeout`, rather than
+> an immediate rejection or a silent stall.
 
 ### Observation (evidence)
 > While the reproduction runs, inspect concurrent writers to one row:
@@ -270,17 +276,46 @@ Capture the control group you'll compare every incident against.
 | Error rate                 |       |              |
 
 ### Root cause & mechanism
-> Explain why concurrency cannot beat serialization on a single hot row. If the
-> critical section is held for W seconds per admit, what is the theoretical max
-> throughput for that one row, regardless of how many callers pile on?
-> 1 / W = ______ admits/sec. Where does the time in the critical section go, and
-> which of the transactional guarantees is enforcing the wait? ________________
+> Concurrency cannot beat serialization on a single hot row because MySQL/
+> InnoDB takes a row-level exclusive (X) lock on that row for the UPDATE
+> (`SHOW ENGINE INNODB STATUS` during the surge shows `RECORD LOCKS ... index
+> PRIMARY of table capacity_lab.hospitals ... lock_mode X locks rec but not
+> gap`), and under InnoDB's two-phase locking protocol that lock is held until
+> COMMIT — not released the instant the row value is written. This is what
+> enforces the transaction's **isolation guarantee**: no other transaction may
+> take a conflicting lock on the same row (and thus cannot read-modify-write
+> `available_beds` concurrently) until the lock-holder commits, which is
+> exactly what prevents two admissions from both decrementing off the same
+> stale bed count. With the critical section held for W ≈ 500ms per admit
+> (dominated by the `notifyBedRegistry()` call executing *inside* the
+> transaction, before commit — the UPDATE itself is single-digit ms), the
+> theoretical max throughput for that one row is 1 / W = 1 / 0.5s = **2
+> admits/sec**, regardless of how many callers pile on. Every VU beyond that
+> ceiling only grows the queue behind the lock; queued transactions that wait
+> longer than `innodb_lock_wait_timeout` (default 50s) fail outright — which
+> matches the observed max latency of ~59.5s (50s timeout + overhead) and the
+> 99.84% error rate at 500 VUs.
 
 ### Fix & verify
-> The change you made (consider: shrinking the critical section, moving slow
-> work out of the transaction, atomic guarded updates, reducing contention on
-> the hot row): _____________________________________________________________
-> Re-measured throughput / error rate: ______________________________________
+> The change you made: moved `notifyBedRegistry(hospitalId)` to *after*
+> `conn.commit()`, called fire-and-forget (`.catch(() => {})`), so the
+> exclusive row lock is released as soon as the UPDATE is committed instead of
+> being held through an unrelated 500ms external call. Trade-off: the client
+> no longer waits on (or is informed of) registry-notification failures, since
+> the admission is already safely committed by the time that call happens —
+> intentional, since the notification is a side effect, not part of the
+> correctness-critical write.
+>
+> Re-measured throughput / error rate — at 20 VUs / 15s (a realistic
+> same-hospital surge): p95 latency dropped from 57.12s to **221.62ms**, error
+> rate dropped from 99.84% to **0.00%** (1590/1590 succeeded), and the
+> ~2 admits/sec hard ceiling for a single hospital's row is gone (no longer
+> lock-bound). Re-run at the original 500 VUs confirms the lock fix itself
+> works — lock hold time drops from ~500ms to ~ms per admission, and the
+> 50-60s lock-wait timeouts are gone — but at that extreme concurrency a
+> *different*, pre-existing bottleneck surfaces: connection resets/EOF errors,
+> the same connectionLimit: 2 / TCP-listen-backlog signature already diagnosed
+> in OPS-2202, not a new bug introduced by this fix.
 
 ---
 
