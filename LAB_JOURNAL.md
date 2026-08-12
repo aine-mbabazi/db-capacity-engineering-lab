@@ -471,13 +471,81 @@ Capture the control group you'll compare every incident against.
 
 > Rank the four incidents by **blast radius** (threat to overall availability at
 > scale), justified with your measured numbers:
-> 1. ____________________________________________________________________
-> 2. ____________________________________________________________________
-> 3. ____________________________________________________________________
-> 4. ____________________________________________________________________
+> 1. **OPS-2204** — worst. The failure mode is a kernel SIGKILL of the entire
+>    container process (`docker events`: `container die`, `exitCode=137`),
+>    not a per-request slowdown. Because the kill happens at the process
+>    level, every in-flight request of *any* kind — not just export calls —
+>    would be dropped during each restart window, and in the bad-luck run
+>    this recurred every 23 seconds for as long as load continued (99.92%
+>    error rate). A full, repeating outage beats a slowdown for worst blast
+>    radius, even though the same script sometimes (Run 1) didn't tip over.
+> 2. **OPS-2202** — app-wide, but no crash. `docker stats` showed capacity-api
+>    CPU-bound at 156% (>1 core) while MySQL sat idle at 22.9%; p95 hit 4.57s,
+>    ~180x worse than the 25.37ms baseline. The mechanism (shared
+>    `connectionLimit: 2` pool + unbounded `queueLimit: 0` queue) sits under
+>    every DB-backed endpoint, not just `/recent` — so this degraded the
+>    whole app under any sufficient surge, without ever returning a single
+>    error (0% error rate pre-fix; it queued rather than failed).
+> 3. **OPS-2201** — scoped mostly to `/api/patients/search`. p95 hit 33.77s,
+>    ~1,330x worse than baseline, and RPS dropped to 9.23 (~5.4x worse), but
+>    the investigation's own root-cause text notes other endpoints like
+>    `/recent` were "likely unaffected" since they don't share the
+>    full-table-scan / unbounded-payload access pattern.
+> 4. **OPS-2203** — narrowest. Contention was explicitly isolated to one
+>    hospital's row at a time; the root-cause investigation states directly
+>    that "different hospitals were largely unaffected by each other," since
+>    different rows mean different locks. Severe for the affected hospital
+>    (p95 57.12s, 99.84% errors at 500 VUs) but structurally contained.
 >
 > If you could ship only **one** fix before a launch, which and why?
-> ____________________________________________________________________________
+> The OPS-2204 fix (streaming/cursor rewrite + the NODE_OPTIONS/cgroup
+> correction) — because it's the only one of the four whose pre-fix failure
+> mode is a full process crash rather than degraded performance, and
+> crash-and-restart is strictly worse than slow-but-alive for overall
+> availability. `connectionLimit: 2` is tempting to name instead, since it's
+> the cross-cutting constraint underneath three of the four tickets (see
+> below), but OPS-2201 and OPS-2202 already directly disproved "just raise
+> it" as a safe blind fix — twice — so shipping a pool-size change without
+> the same kind of isolated, dedicated measurement those two incidents used
+> would repeat the exact mistake this lab already caught.
 >
 > For each incident, what alert or dashboard would have caught it in production
-> *before* a user filed a ticket? ____________________________________________
+> *before* a user filed a ticket?
+> - **OPS-2201:** a dashboard alerting on p95 latency by route, or on
+>   full-table-scan queries.
+> - **OPS-2202:** a dashboard on in-flight request count vs. the admission
+>   cap.
+> - **OPS-2203:** a dashboard on lock-wait-timeout error counts by table.
+> - **OPS-2204:** an alert on container RSS as a fraction of the cgroup
+>   memory limit — not on the Node-reported heap figure against the V8
+>   `--max-old-space-size` limit, which would have stayed quiet the whole
+>   time (heap peaked at ~118-158MB against a 256MB V8 ceiling that was never
+>   the real constraint).
+>
+> **Cross-cutting pattern:** `connectionLimit: 2` was never itself the bug in
+> any single ticket — in OPS-2201 and OPS-2202 it was directly tested and
+> ruled out as the fix (raising it to 20 made p95 *worse* both times, 33.77s→
+> 48.4s and 4.57s→14.04s, because more concurrent connections just meant more
+> work competing for the same single-threaded CPU). But once each incident's
+> actual root cause was fixed, that same `connectionLimit: 2` reappeared as
+> the next binding constraint: it's the mechanism behind OPS-2202's
+> ~190 req/s pool ceiling, it resurfaces as connection resets/EOF errors once
+> OPS-2203's lock fix is verified at 500 VUs, and it's what turns OPS-2204's
+> post-fix export into a ~74-second request (101 sequential round trips
+> through 2 connections). It's the shared ceiling sitting underneath three of
+> the four tickets — a legitimate cross-cutting follow-up item, distinct from
+> any single ticket's fix, and one that (per the point above) needs its own
+> isolated measurement rather than a blind bump.
+>
+> **Recurring anti-pattern:** "add more capacity/connections" was the
+> instinctive first fix tried in both OPS-2201 and OPS-2202, and both times
+> it was directly tested and disproven before the real fix was found — it
+> made things measurably worse (higher p95, higher error rate), not better,
+> because the actual constraint was CPU/event-loop time, not connection
+> count. The fixes that actually worked in all four incidents were cheaper
+> and more targeted than "more capacity": an index + bounded columns
+> (OPS-2201), an admission-control cap (OPS-2202), moving one call outside a
+> transaction (OPS-2203), and bounding memory per request via streaming
+> (OPS-2204). None of the four real fixes added hardware or raised a limit —
+> each one reduced the amount of work or memory a single request could
+> demand.
