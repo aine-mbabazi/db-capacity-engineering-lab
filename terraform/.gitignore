@@ -1,0 +1,12 @@
+# Local Terraform state/working files - never commit real state or the
+# backend-config file that carries the group's actual bucket/table names.
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+backend.hcl
+*.tfvars
+*.tfvars.json
+!example.tfvars
+crash.log
+crash.*.log
