@@ -12,11 +12,16 @@
  *   GET  /api/patients/export        Full patient export for the analytics team
  *   GET  /api/audit/ping             Mongo audit-store health probe
  *   GET  /metrics                    Prometheus metrics
+ *   GET  /healthz                    Liveness: process is up
+ *   GET  /readyz                     Readiness: DB reachable, pool not
+ *                                     saturated, secret resolved at boot
+ *   GET  /debug/secret-source        Which secret (arn/versionId) is loaded
  */
 
 const express = require('express');
 const client = require('prom-client');
-const { getPool, getMongo } = require('./database');
+const { getPool, getProbePool, isPoolSaturated, getMongo, initPool } = require('./database');
+const { getSecretSource } = require('./secrets');
 
 const app = express();
 app.use(express.json());
@@ -81,8 +86,76 @@ app.use((req, res, next) => {
 
 // ---------------------------------------------------------------------------
 // Health & metrics
+//
+// /health is kept as-is (existing consumers may already poll it) and
+// /healthz is added alongside it as the same trivial liveness check, so
+// nothing that already depends on /health breaks.
 // ---------------------------------------------------------------------------
 app.get('/health', (_req, res) => res.json({ status: 'ok' }));
+app.get('/healthz', (_req, res) => res.json({ status: 'ok' }));
+
+const READYZ_QUERY_TIMEOUT_MS = 1000;
+
+// Readiness = can this instance actually serve a request right now:
+//   1. the boot-time secret load succeeded (getSecretSource().arn is set -
+//      see secrets.js, which sets it to null on failure),
+//   2. the HTTP-layer concurrency gate isn't already maxed out (same
+//      inFlight/MAX_CONCURRENT_REQUESTS counter the limiter middleware
+//      above uses),
+//   3. the DB pool itself isn't saturated (distinct failure mode from #2 -
+//      see isPoolSaturated()'s doc comment in database.js),
+//   4. a trivial query actually completes within a short timeout, run on a
+//      dedicated probe pool (not the main pool - see database.js) so this
+//      check never queues behind real traffic. MAX_EXECUTION_TIME(1000)
+//      asks MySQL to kill the query server-side if it's stuck; the
+//      Promise.race is a client-side safety net for the case where the
+//      connection itself is stuck below the query layer (network hang)
+//      and the server-side hint never gets a chance to apply - between the
+//      two, nothing is left holding an orphaned query on either side. Also
+//      catches initPool() not having finished yet, since getProbePool()
+//      throws until then.
+app.get('/readyz', async (_req, res) => {
+  const reasons = [];
+
+  if (!getSecretSource().arn) {
+    reasons.push('secret not resolved');
+  }
+
+  if (inFlight >= MAX_CONCURRENT_REQUESTS) {
+    reasons.push('http concurrency saturated');
+  }
+
+  try {
+    if (isPoolSaturated()) {
+      reasons.push('db pool saturated');
+    }
+  } catch (err) {
+    reasons.push(`db pool not reachable: ${err.message}`);
+  }
+
+  try {
+    const probePool = getProbePool();
+    await Promise.race([
+      probePool.query('SELECT /*+ MAX_EXECUTION_TIME(1000) */ 1'),
+      new Promise((_resolve, reject) => {
+        setTimeout(() => reject(new Error('query timed out')), READYZ_QUERY_TIMEOUT_MS);
+      }),
+    ]);
+  } catch (err) {
+    reasons.push(`db not reachable: ${err.message}`);
+  }
+
+  if (reasons.length > 0) {
+    return res.status(503).json({ status: 'not ready', reasons });
+  }
+  res.json({ status: 'ready' });
+});
+
+// What secret (if any) is actually loaded right now - arn + versionId only,
+// never credential values. This is what C8's `make verify` checks.
+app.get('/debug/secret-source', (_req, res) => {
+  res.json(getSecretSource());
+});
 
 app.get('/metrics', async (_req, res) => {
   res.set('Content-Type', register.contentType);
@@ -241,8 +314,21 @@ app.get('/api/audit/ping', async (_req, res) => {
 
 // ---------------------------------------------------------------------------
 // Boot
+//
+// Secret + pool init happens once here, before we start accepting traffic,
+// so every route's synchronous getPool() call is safe and /readyz's boot-
+// time secret check has something to report from the moment the process is
+// listening.
 // ---------------------------------------------------------------------------
-app.listen(PORT, () => {
-  // eslint-disable-next-line no-console
-  console.log(`capacity-api listening on :${PORT} (metrics at /metrics)`);
-});
+initPool()
+  .then(() => {
+    app.listen(PORT, () => {
+      // eslint-disable-next-line no-console
+      console.log(`capacity-api listening on :${PORT} (metrics at /metrics)`);
+    });
+  })
+  .catch((err) => {
+    // eslint-disable-next-line no-console
+    console.error(`[boot] failed to initialize DB pool: ${err.message}`);
+    process.exit(1);
+  });
