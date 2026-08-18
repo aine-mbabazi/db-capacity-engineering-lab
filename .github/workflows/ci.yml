@@ -1,0 +1,125 @@
+# ci.yml — caller CI for capacity-api (individually-owned repo)
+#
+# This calls the group's reusable golden-ci workflow (gitleaks + trivy-config
+# + zizmor) via the `golden-ci` job below, then adds jobs owned by this repo:
+#   - docker-build-and-scan: builds the api image and runs a trivy image scan.
+#   - tflocal-apply:         placeholder for the LocalStack terraform apply
+#                             step, wired up in a later change.
+#
+# The AMI tag format `localstack-ec2/<name>:ami-<12hex>` is required by
+# LocalStack's EC2 backend — see ASSIGNMENT.md "The four things that will
+# break first", item 2.
+#
+# All actions below are pinned by full commit SHA, with a human-readable
+# tag comment alongside each pin.
+
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  golden-ci:
+    # TODO: pin to the merged main SHA of regional-health-platform once the
+    # golden-ci-workflow PR is merged. Using the branch ref during review only.
+    uses: aine-mbabazi/regional-health-platform/.github/workflows/ci.yml@golden-ci-workflow
+    with:
+      app_image_name: capacity-api
+      terraform_dir: terraform
+    secrets:
+      LOCALSTACK_AUTH_TOKEN: ${{ secrets.LOCALSTACK_AUTH_TOKEN }}
+
+  docker-build-and-scan:
+    needs: golden-ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Compute image tag
+        id: image
+        run: |
+          AMI_TAG="ami-$(echo ${{ github.sha }} | cut -c1-12)"
+          IMAGE="localstack-ec2/capacity-api:${AMI_TAG}"
+          echo "ami_tag=${AMI_TAG}" >> "$GITHUB_OUTPUT"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Build image
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: ./api
+          file: ./api/Dockerfile
+          load: true # need it locally for trivy to scan
+          tags: ${{ steps.image.outputs.image }}
+          push: false
+
+      - name: Trivy image scan
+        uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          scan-type: image
+          image-ref: ${{ steps.image.outputs.image }}
+          severity: HIGH,CRITICAL
+          exit-code: 1
+          ignore-unfixed: true # base-image CVEs with no fix available shouldn't block the build
+          format: json
+          output: trivy-image.json
+
+      - name: Upload trivy report
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: trivy-image-report
+          path: trivy-image.json
+
+      - name: Print image tag + digest
+        if: always()
+        run: |
+          echo "image tag: ${{ steps.image.outputs.image }}"
+          docker image inspect --format='local image id (sha256): {{.Id}}' "${{ steps.image.outputs.image }}" || true
+
+  # TODO: wire terraform init + apply against LocalStack inside the runner
+  # once modules/data and modules/service are implemented in the group repo.
+  # Should also load the app image built above as a docker image
+  # (localstack-ec2/capacity-api:${AMI_TAG}) into LocalStack's EC2 backend
+  # before apply, per the ASSIGNMENT.md "InvalidAMIID.NotFound" warning.
+  tflocal-apply:
+    needs: docker-build-and-scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Harden Runner
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Not yet wired
+        run: |
+          echo "tflocal-apply: not yet wired — pending group modules/data and modules/service being implemented and LocalStack setup"
+          exit 0

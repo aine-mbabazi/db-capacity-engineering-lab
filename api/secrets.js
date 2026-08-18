@@ -10,11 +10,6 @@
  * The client is pointed at process.env.AWS_ENDPOINT_URL when set (LocalStack)
  * and at the default AWS endpoints when it's unset - there is no separate
  * "isLocalStack" branch, the same binary just works against either.
- *
- * The managed DB is Aiven MySQL (external, TLS-required), so the envelope
- * also carries ca_cert - the CA's PEM used to verify the server certificate.
- * Local docker-compose mysql doesn't need TLS, so ca_cert is null when
- * unset - null means "no TLS" all the way through to database.js.
  */
 
 const { SecretsManagerClient, GetSecretValueCommand } = require('@aws-sdk/client-secrets-manager');
@@ -38,7 +33,6 @@ function credentialsFromEnv() {
       username: process.env.MYSQL_USER || 'root',
       password: process.env.MYSQL_PASSWORD || 'labpassword',
       dbname: process.env.MYSQL_DATABASE || 'capacity_lab',
-      ca_cert: process.env.MYSQL_CA_CERT || null,
     },
     source: { arn: 'env', versionId: 'n/a' },
   };
@@ -50,8 +44,7 @@ async function fetchFromSecretsManager(secretArn) {
   const source = { arn: response.ARN || secretArn, versionId: response.VersionId };
 
   // Log only the identifiers needed to prove which secret/version got
-  // loaded - never the envelope itself, which carries the password (and
-  // now the CA cert).
+  // loaded - never the envelope itself, which carries the password.
   // eslint-disable-next-line no-console
   console.log(`[secrets] loaded DB credentials from ${source.arn} (version ${source.versionId})`);
 
@@ -62,7 +55,6 @@ async function fetchFromSecretsManager(secretArn) {
       username: envelope.username,
       password: envelope.password,
       dbname: envelope.dbname,
-      ca_cert: envelope.ca_cert,
     },
     source,
   };
