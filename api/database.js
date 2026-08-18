@@ -67,6 +67,12 @@ async function initPool() {
     password: creds.password,
     database: creds.dbname,
   };
+  // Aiven MySQL requires TLS; local docker-compose mysql doesn't, so
+  // ca_cert is null there and we omit ssl entirely rather than pass a
+  // useless/empty option.
+  if (creds.ca_cert) {
+    connectionConfig.ssl = { ca: creds.ca_cert };
+  }
   pool = mysql.createPool({ ...connectionConfig, ...POOL_SETTINGS });
   probePool = mysql.createPool({ ...connectionConfig, ...PROBE_POOL_SETTINGS });
   return pool;
