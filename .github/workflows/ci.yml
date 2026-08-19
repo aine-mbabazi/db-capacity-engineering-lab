@@ -29,9 +29,7 @@ concurrency:
 
 jobs:
   golden-ci:
-    # TODO: pin to the merged main SHA of regional-health-platform once the
-    # golden-ci-workflow PR is merged. Using the branch ref during review only.
-    uses: aine-mbabazi/regional-health-platform/.github/workflows/ci.yml@golden-ci-workflow
+    uses: aine-mbabazi/regional-health-platform/.github/workflows/ci.yml@9e609c27360a0b64739df7d15adda731d1bee213
     with:
       app_image_name: capacity-api
       terraform_dir: terraform
