@@ -1,0 +1,42 @@
+groups:
+  - name: capacity-lab-incidents
+    rules:
+      - alert: APIHighLatencyP95
+        expr: histogram_quantile(0.95, sum by (le, route) (rate(http_request_duration_seconds_bucket[2m]))) > 1
+        for: 2m
+        labels:
+          severity: warning
+          incident: OPS-2201
+        annotations:
+          summary: "API p95 latency > 1s on {{ $labels.route }}"
+          description: "The 95th percentile request latency on {{ $labels.route }} has been over 1s for 2 minutes. This is the OPS-2201 signature — slow/unindexed queries under load."
+
+      - alert: APIReadinessDegraded
+        expr: capacity_api_ready == 0
+        for: 30s
+        labels:
+          severity: critical
+          incident: OPS-2202
+        annotations:
+          summary: "capacity-api /readyz returning 503"
+          description: "The api process is up but /readyz is returning 503 (pool saturated, db unreachable, or boot-time secret failed to load). Under nginx this instance would be pulled out of rotation. This is the OPS-2202 signature."
+
+      - alert: DBErrorsSpike
+        expr: sum(rate(db_errors_total[1m])) > 0.5
+        for: 2m
+        labels:
+          severity: warning
+          incident: OPS-2203
+        annotations:
+          summary: "DB errors exceeding 0.5/s"
+          description: "Database errors are exceeding 0.5 errors/sec sustained for 2 minutes. Check for integrity constraint violations (OPS-2203 signature: bed count going negative) or connection failures."
+
+      - alert: APIMemoryNearContainerLimit
+        expr: process_resident_memory_bytes{job="capacity-api"} / (160 * 1024 * 1024) > 0.85
+        for: 1m
+        labels:
+          severity: critical
+          incident: OPS-2204
+        annotations:
+          summary: "capacity-api memory > 85% of 160MB cap"
+          description: "Container is using >85% of its 160MB memory cap and the OOM killer is imminent. This is the OPS-2204 signature — unbounded response allocation. The container will be killed within seconds if memory keeps climbing."

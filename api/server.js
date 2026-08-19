@@ -72,6 +72,12 @@ const dbErrorsTotal = new client.Counter({
   registers: [register],
 });
 
+const readyGauge = new client.Gauge({
+  name: 'capacity_api_ready',
+  help: '1 when /readyz would return 200, 0 otherwise',
+  registers: [register],
+});
+
 // Per-request timing + counting middleware
 app.use((req, res, next) => {
   const end = httpRequestDuration.startTimer();
@@ -144,6 +150,8 @@ app.get('/readyz', async (_req, res) => {
   } catch (err) {
     reasons.push(`db not reachable: ${err.message}`);
   }
+
+  readyGauge.set(reasons.length === 0 ? 1 : 0);
 
   if (reasons.length > 0) {
     return res.status(503).json({ status: 'not ready', reasons });
