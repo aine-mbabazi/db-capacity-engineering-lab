@@ -1,5 +1,35 @@
 # Regional Health — Reliability On-Call Lab 🧪
 
+> **A2 Rehost Progress:** this repo extends the A1 capacity lab with a 
+> cloud-shaped deployment: hardened multi-stage Docker image, Terraform 
+> IaC composing group modules (RDS-as-Secrets + EC2), Aiven MySQL as 
+> managed DB, TLS to the database, `/healthz` + `/readyz` + 
+> `/debug/secret-source` endpoints, Prometheus alert rules mapped to the 
+> A1 incidents, and CI gates (gitleaks + trivy + zizmor) enforcing 
+> supply-chain hygiene.
+>
+> **Start here for A2 grading:**
+> - `evidence/README.md` — full evidence index (baseline monitoring + 
+>   incident replays for OPS-2201..2204)
+> - `FIDELITY.md` — 6 documented trade-offs / gaps for C9
+> - `CONTRIBUTIONS.md` — individual + group PR log for anti-free-rider
+> - `terraform/` — root module composing group's `modules/data` + 
+>   `modules/service` from 
+>   [regional-health-platform](https://github.com/aine-mbabazi/regional-health-platform)
+> - `api/secrets.js`, `api/database.js` — Secrets Manager + TLS wiring
+> - `api/Dockerfile` — hardened multi-stage build (digest-pinned, non-root, 
+>   node-based healthcheck)
+> - `.github/workflows/ci.yml` — this repo's CI, calls group's golden 
+>   reusable workflow
+>
+> **A2 port map** (differs from A1 to avoid host collisions with local 
+> tools):  
+> Grafana: `http://localhost:3002` · Prometheus: `http://localhost:9091` · 
+> capacity-api: `http://localhost:3003`
+
+---
+
+
 A hands-on "Lab-in-a-Box" for learning **database mechanics, performance tuning,
 and capacity engineering** the way you actually learn them on the job: by picking
 up an incident ticket, reproducing the symptom, and investigating until you find
